@@ -20,6 +20,7 @@
 #define MAX_LINE     256
 #define MAX_FILENAME 64
 #define MAX_PATH     256
+#define MAX_CONTENT  4096
 
 /* colours used for status lines */
 #define CLR_RESET  "\033[0m"
@@ -421,6 +422,73 @@ static void delete_vault_file(const char *filename) {
     audit(session_user, "DELETE", "SUCCESS");
 }
 
+/* Reads a file's contents into buffer if the user has read permission. */
+static int read_vault_file(const char *filename, char *buffer, int buf_size) {
+    char owner[MAX_NAME], group[MAX_NAME], perms[16];
+
+    if (!read_meta(filename, owner, group, perms)) {
+        err("File not found.");
+        audit(session_user, "READ", "FAILED (not found)");
+        return 0;
+    }
+
+    char relation = relation_to(session_user, session_group, owner, group);
+    if (!has_permission(perms, relation, 'r')) {
+        err("Permission denied - you need read permission.");
+        audit(session_user, "READ", "FAILED (permission denied)");
+        return 0;
+    }
+
+    char path[MAX_PATH];
+    storage_path(filename, path);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        err("Could not open file.");
+        audit(session_user, "READ", "FAILED (I/O error)");
+        return 0;
+    }
+
+    size_t len = fread(buffer, 1, buf_size - 1, f);
+    buffer[len] = '\0';
+    fclose(f);
+
+    audit(session_user, "READ", "SUCCESS");
+    return 1;
+}
+
+/* Writes or appends text to a file if the user has write permission. */
+static int write_vault_file(const char *filename, const char *content, int append) {
+    char owner[MAX_NAME], group[MAX_NAME], perms[16];
+
+    if (!read_meta(filename, owner, group, perms)) {
+        err("File not found.");
+        audit(session_user, "WRITE", "FAILED (not found)");
+        return 0;
+    }
+
+    char relation = relation_to(session_user, session_group, owner, group);
+    if (!has_permission(perms, relation, 'w')) {
+        err("Permission denied - you need write permission.");
+        audit(session_user, "WRITE", "FAILED (permission denied)");
+        return 0;
+    }
+
+    char path[MAX_PATH];
+    storage_path(filename, path);
+    FILE *f = fopen(path, append ? "a" : "w");
+    if (!f) {
+        err("Could not open file for writing.");
+        audit(session_user, "WRITE", "FAILED (I/O error)");
+        return 0;
+    }
+
+    fprintf(f, "%s\n", content);
+    fclose(f);
+
+    audit(session_user, "WRITE", "SUCCESS");
+    return 1;
+}
+
 /* file operation screens */
 
 /* Screen for creating a new file with permission settings. */
@@ -457,6 +525,36 @@ static void screen_create_file(void) {
     }
 }
 
+/* Screen for reading a file's contents. */
+static void screen_read_file(void) {
+    section("Read File");
+    char filename[MAX_FILENAME];
+    ask("Filename : ", filename, sizeof(filename));
+
+    char content[MAX_CONTENT];
+    if (read_vault_file(filename, content, sizeof(content))) {
+        printf("\n--- %s ---\n%s\n------------------\n", filename, content);
+    }
+}
+
+/* Screen for writing or appending to a file. */
+static void screen_write_file(void) {
+    section("Write File");
+    char filename[MAX_FILENAME];
+    ask("Filename : ", filename, sizeof(filename));
+
+    char mode[8];
+    ask("Overwrite or append? (o/a) : ", mode, sizeof(mode));
+    int append = (mode[0] == 'a' || mode[0] == 'A');
+
+    char content[MAX_CONTENT];
+    ask("Content : ", content, sizeof(content));
+
+    if (write_vault_file(filename, content, append)) {
+        ok("File saved.");
+    }
+}
+
 /* Screen for displaying file information. */
 static void screen_file_info(void) {
     section("File Info");
@@ -488,21 +586,27 @@ static void vault_menu(void) {
         printf("\n" CLR_INFO "[ Vault - %s (%s) ]" CLR_RESET "\n",
                session_user, session_group);
         printf("1) Create file\n");
-        printf("2) List files\n");
-        printf("3) File info\n");
-        printf("4) Delete file\n");
-        printf("5) Logout\n");
+        printf("2) Read file\n");
+        printf("3) Write file\n");
+        printf("4) List files\n");
+        printf("5) File info\n");
+        printf("6) Delete file\n");
+        printf("7) Logout\n");
         ask("Choose: ", choice, sizeof(choice));
 
         if (strcmp(choice, "1") == 0) {
             screen_create_file();
         } else if (strcmp(choice, "2") == 0) {
-            list_vault_files();
+            screen_read_file();
         } else if (strcmp(choice, "3") == 0) {
-            screen_file_info();
+            screen_write_file();
         } else if (strcmp(choice, "4") == 0) {
-            screen_delete_file();
+            list_vault_files();
         } else if (strcmp(choice, "5") == 0) {
+            screen_file_info();
+        } else if (strcmp(choice, "6") == 0) {
+            screen_delete_file();
+        } else if (strcmp(choice, "7") == 0) {
             audit(session_user, "LOGOUT", "SUCCESS");
             session_active = 0;
             return;
