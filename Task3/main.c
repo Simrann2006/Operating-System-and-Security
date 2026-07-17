@@ -71,6 +71,17 @@ static void ask_secret(const char *prompt, char *buf, int size) {
     strip_nl(buf);
 }
 
+/* Reads multiple lines of input until a single '.' on its own line. */
+static void ask_multiline(const char *prompt, char *buf, int size) {
+    printf("%s", prompt);
+    buf[0] = '\0';
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), stdin)) {
+        if (strcmp(line, ".\n") == 0 || strcmp(line, ".") == 0) break;
+        strncat(buf, line, size - strlen(buf) - 1);
+    }
+}
+
 /* Creates the folders used to store all vault files and metadata. */
 static void setup_storage(void) {
     mkdir(DATA_DIR, 0700);
@@ -482,7 +493,7 @@ static int write_vault_file(const char *filename, const char *content, int appen
         return 0;
     }
 
-    fprintf(f, "%s\n", content);
+    fputs(content, f);
     fclose(f);
 
     audit(session_user, "WRITE", "SUCCESS");
@@ -548,7 +559,8 @@ static void screen_write_file(void) {
     int append = (mode[0] == 'a' || mode[0] == 'A');
 
     char content[MAX_CONTENT];
-    ask("Content : ", content, sizeof(content));
+    printf(CLR_PROMPT "Content : " CLR_RESET);
+    ask_multiline("", content, sizeof(content));
 
     if (write_vault_file(filename, content, append)) {
         ok("File saved.");
