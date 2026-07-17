@@ -7,14 +7,19 @@
 #include <termios.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <dirent.h>
 
-#define DATA_DIR   "vault_data"
-#define USERS_FILE "vault_data/users.db"
-#define AUDIT_FILE "vault_data/audit.log"
+#define DATA_DIR    "vault_data"
+#define USERS_FILE  "vault_data/users.db"
+#define AUDIT_FILE  "vault_data/audit.log"
+#define STORAGE_DIR "vault_data/storage"
+#define META_DIR    "vault_data/meta"
 
-#define MAX_NAME  32
-#define MAX_PASS  128
-#define MAX_LINE  256
+#define MAX_NAME     32
+#define MAX_PASS     128
+#define MAX_LINE     256
+#define MAX_FILENAME 64
+#define MAX_PATH     256
 
 /* colours used for status lines */
 #define CLR_RESET  "\033[0m"
@@ -65,9 +70,11 @@ static void ask_secret(const char *prompt, char *buf, int size) {
     strip_nl(buf);
 }
 
-/* Creates the folder used to store all vault files. */
+/* Creates the folders used to store all vault files and metadata. */
 static void setup_storage(void) {
     mkdir(DATA_DIR, 0700);
+    mkdir(STORAGE_DIR, 0700);
+    mkdir(META_DIR, 0700);
 }
 
 /* Writes user actions such as login and registration
@@ -174,9 +181,6 @@ static int do_login(const char *username, const char *password, char *out_group)
     return 0;
 }
 
-/* Functions below handle the different menu screens
-   shown to the user. */
-
 /* Registration screen where a new account is created. */
 static void screen_register(void) {
     section("Register");
@@ -224,21 +228,287 @@ static int screen_login(void) {
     return 0;
 }
 
+/* Helper functions for creating file and metadata paths. */
+
+/* Creates the full path where the file will be stored. */
+static void storage_path(const char *filename, char *out) {
+    snprintf(out, MAX_PATH, "%s/%s", STORAGE_DIR, filename);
+}
+
+/* Creates the full path for the file's metadata. */
+static void meta_path(const char *filename, char *out) {
+    snprintf(out, MAX_PATH, "%s/%s.meta", META_DIR, filename);
+}
+
+/* Checks if a file exists at the given path. */
+static int file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0;
+}
+
+/* Each file has a metadata file that stores
+   the owner, group and permission settings. */
+
+/* Saves metadata for a file: owner, group, and permissions. */
+static void write_meta(const char *filename, const char *owner,
+                        const char *group, const char *perms) {
+    char path[MAX_PATH];
+    meta_path(filename, path);
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "owner=%s\ngroup=%s\nperms=%s\n", owner, group, perms);
+    fclose(f);
+}
+
+/* Reads the saved metadata for a file. */
+static int read_meta(const char *filename, char *owner, char *group, char *perms) {
+    char path[MAX_PATH];
+    meta_path(filename, path);
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), f)) {
+        strip_nl(line);
+        if (strncmp(line, "owner=", 6) == 0) strcpy(owner, line + 6);
+        else if (strncmp(line, "group=", 6) == 0) strcpy(group, line + 6);
+        else if (strncmp(line, "perms=", 6) == 0) strcpy(perms, line + 6);
+    }
+    fclose(f);
+    return 1;
+}
+
+/* File permissions follow the format:
+   owner | group | others
+   Example: rw-r----- */
+
+/* Checks if the permission string is valid. */
+static int valid_perms(const char *perms) {
+    if (strlen(perms) != 9) return 0;
+    const char expected[9] = { 'r','w','x','r','w','x','r','w','x' };
+    for (int i = 0; i < 9; i++)
+        if (perms[i] != '-' && perms[i] != expected[i]) return 0;
+    return 1;
+}
+
+/* Finds whether the current user is
+   the owner, in the same group, or another user. */
+static char relation_to(const char *username, const char *user_group,
+                         const char *owner, const char *file_group) {
+    if (strcmp(username, owner) == 0) return 'o';
+    if (strcmp(user_group, file_group) == 0) return 'g';
+    return 't';
+}
+
+/* Checks if the user has the required permission (r/w/x) for a file. */
+static int has_permission(const char *perms, char relation, char action) {
+    int base   = (relation == 'o') ? 0 : (relation == 'g') ? 3 : 6;
+    int offset = (action == 'r') ? 0 : (action == 'w') ? 1 : 2;
+    return perms[base + offset] == action;
+}
+
+/* Creates a new empty file with the specified permissions and metadata. */
+static int create_vault_file(const char *filename, const char *perms) {
+    char path[MAX_PATH];
+    storage_path(filename, path);
+    
+    if (file_exists(path)) {
+        return 0;
+    }
+
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return 0;
+    }
+    fclose(f);
+
+    write_meta(filename, session_user, session_group, perms);
+    return 1;
+}
+
+/* Lists all files in the vault with their metadata. */
+static void list_vault_files(void) {
+    DIR *dir = opendir(META_DIR);
+    if (!dir) {
+        printf("\nNo files found.\n");
+        return;
+    }
+    
+    printf("\n" CLR_INFO "Files in vault:" CLR_RESET "\n");
+    printf("%-20s %-12s %-10s %s\n", "Filename", "Owner", "Group", "Perms");
+    printf("--------------------------------------------------------\n");
+    
+    struct dirent *entry;
+    int count = 0;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        char *ext = strstr(entry->d_name, ".meta");
+        if (ext && strlen(ext) == 5) {
+            char filename[MAX_FILENAME];
+            strncpy(filename, entry->d_name, ext - entry->d_name);
+            filename[ext - entry->d_name] = '\0';
+            
+            char owner[MAX_NAME], group[MAX_NAME], perms[16];
+            if (read_meta(filename, owner, group, perms)) {
+                printf("%-20s %-12s %-10s %s\n", filename, owner, group, perms);
+                count++;
+            }
+        }
+    }
+    
+    closedir(dir);
+    printf("--------------------------------------------------------\n");
+    printf("Total: %d file(s)\n", count);
+}
+
+/* Displays detailed information about a specific file. */
+static void file_info(const char *filename) {
+    char owner[MAX_NAME], group[MAX_NAME], perms[16];
+    
+    if (!read_meta(filename, owner, group, perms)) {
+        err("File not found.");
+        audit(session_user, "FILE_INFO", "FAILED (not found)");
+        return;
+    }
+    
+    printf("\nFile: %s\n", filename);
+    printf("  Owner: %s\n", owner);
+    printf("  Group: %s\n", group);
+    printf("  Permissions: %s\n", perms);
+    
+    char relation = relation_to(session_user, session_group, owner, group);
+    printf("  Your relation: %s\n", 
+           relation == 'o' ? "owner" : 
+           relation == 'g' ? "group member" : "other");
+    
+    printf("  Permissions for you: ");
+    if (has_permission(perms, relation, 'r')) printf("r"); else printf("-");
+    if (has_permission(perms, relation, 'w')) printf("w"); else printf("-");
+    if (has_permission(perms, relation, 'x')) printf("x"); else printf("-");
+    printf("\n");
+}
+
+/* Deletes a file if the user has write permission. */
+static void delete_vault_file(const char *filename) {
+    char owner[MAX_NAME], group[MAX_NAME], perms[16];
+    
+    if (!read_meta(filename, owner, group, perms)) {
+        err("File not found.");
+        audit(session_user, "DELETE", "FAILED (not found)");
+        return;
+    }
+    
+    char relation = relation_to(session_user, session_group, owner, group);
+    if (!has_permission(perms, relation, 'w')) {
+        err("Permission denied - you need write permission.");
+        audit(session_user, "DELETE", "FAILED (permission denied)");
+        return;
+    }
+    
+    char path[MAX_PATH];
+    storage_path(filename, path);
+    if (unlink(path) != 0) {
+        err("Failed to delete file.");
+        audit(session_user, "DELETE", "FAILED (I/O error)");
+        return;
+    }
+    
+    /* Remove the metadata file */
+    meta_path(filename, path);
+    unlink(path);
+    
+    ok("File deleted successfully.");
+    audit(session_user, "DELETE", "SUCCESS");
+}
+
+/* file operation screens */
+
+/* Screen for creating a new file with permission settings. */
+static void screen_create_file(void) {
+    section("Create File");
+    char filename[MAX_FILENAME];
+    ask("Filename : ", filename, sizeof(filename));
+
+    char path[MAX_PATH];
+    storage_path(filename, path);
+    if (file_exists(path)) {
+        err("A file with that name already exists.");
+        audit(session_user, "CREATE", "FAILED (exists)");
+        return;
+    }
+
+    printf("Permission format is 9 characters: owner|group|other, e.g. rw-r-----\n");
+    char perms[16];
+    ask("Permissions [default rw-r-----] : ", perms, sizeof(perms));
+    if (strlen(perms) == 0) {
+        strcpy(perms, "rw-r-----");
+    } else if (!valid_perms(perms)) {
+        err("Invalid format, using default rw-r-----.");
+        strcpy(perms, "rw-r-----");
+    }
+
+    if (create_vault_file(filename, perms)) {
+        ok("File created.");
+        printf("  owner=%s  group=%s  perms=%s\n", session_user, session_group, perms);
+        audit(session_user, "CREATE", "SUCCESS");
+    } else {
+        err("Could not create file.");
+        audit(session_user, "CREATE", "FAILED (I/O error)");
+    }
+}
+
+/* Screen for displaying file information. */
+static void screen_file_info(void) {
+    section("File Info");
+    char filename[MAX_FILENAME];
+    ask("Filename : ", filename, sizeof(filename));
+    file_info(filename);
+}
+
+/* Screen for deleting a file. */
+static void screen_delete_file(void) {
+    section("Delete File");
+    char filename[MAX_FILENAME];
+    ask("Filename to delete : ", filename, sizeof(filename));
+    
+    char confirm[8];
+    ask("Are you sure? (y/n) : ", confirm, sizeof(confirm));
+    if (strcmp(confirm, "y") != 0 && strcmp(confirm, "Y") != 0) {
+        ok("Deletion cancelled.");
+        return;
+    }
+    
+    delete_vault_file(filename);
+}
+
 /* Vault menu shown after a successful login. */
 static void vault_menu(void) {
     char choice[8];
     while (1) {
         printf("\n" CLR_INFO "[ Vault - %s (%s) ]" CLR_RESET "\n",
                session_user, session_group);
-        printf("1) Logout\n");
+        printf("1) Create file\n");
+        printf("2) List files\n");
+        printf("3) File info\n");
+        printf("4) Delete file\n");
+        printf("5) Logout\n");
         ask("Choose: ", choice, sizeof(choice));
 
         if (strcmp(choice, "1") == 0) {
+            screen_create_file();
+        } else if (strcmp(choice, "2") == 0) {
+            list_vault_files();
+        } else if (strcmp(choice, "3") == 0) {
+            screen_file_info();
+        } else if (strcmp(choice, "4") == 0) {
+            screen_delete_file();
+        } else if (strcmp(choice, "5") == 0) {
             audit(session_user, "LOGOUT", "SUCCESS");
             session_active = 0;
             return;
+        } else {
+            err("Invalid option.");
         }
-        err("Invalid option.");
     }
 }
 
