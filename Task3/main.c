@@ -500,6 +500,34 @@ static int write_vault_file(const char *filename, const char *content, int appen
     return 1;
 }
 
+/* Changes a file's permission string. Only the owner can do this. */
+static int chmod_vault_file(const char *filename, const char *new_perms) {
+    char owner[MAX_NAME], group[MAX_NAME], perms[16];
+
+    if (!read_meta(filename, owner, group, perms)) {
+        err("File not found.");
+        audit(session_user, "CHMOD", "FAILED (not found)");
+        return 0;
+    }
+
+    if (strcmp(session_user, owner) != 0) {
+        err("Permission denied - only the owner can change permissions.");
+        audit(session_user, "CHMOD", "FAILED (not owner)");
+        return 0;
+    }
+
+    if (!valid_perms(new_perms)) {
+        err("Invalid permission format.");
+        audit(session_user, "CHMOD", "FAILED (invalid format)");
+        return 0;
+    }
+
+    write_meta(filename, owner, group, new_perms);
+    ok("Permissions updated.");
+    audit(session_user, "CHMOD", "SUCCESS");
+    return 1;
+}
+
 /* file operation screens */
 
 /* Screen for creating a new file with permission settings. */
@@ -575,6 +603,26 @@ static void screen_file_info(void) {
     file_info(filename);
 }
 
+/* Screen for changing a file's permissions. Only the owner can do this. */
+static void screen_chmod_file(void) {
+    section("Change Permissions");
+    char filename[MAX_FILENAME];
+    ask("Filename : ", filename, sizeof(filename));
+
+    char owner[MAX_NAME], group[MAX_NAME], perms[16];
+    if (!read_meta(filename, owner, group, perms)) {
+        err("File not found.");
+        return;
+    }
+    printf("Current permissions: %s\n", perms);
+    printf("Permission format is 9 characters: owner|group|other, e.g. rw-r-----\n");
+
+    char new_perms[16];
+    ask("New permissions : ", new_perms, sizeof(new_perms));
+
+    chmod_vault_file(filename, new_perms);
+}
+
 /* Screen for deleting a file. */
 static void screen_delete_file(void) {
     section("Delete File");
@@ -602,8 +650,9 @@ static void vault_menu(void) {
         printf("3) Write file\n");
         printf("4) List files\n");
         printf("5) File info\n");
-        printf("6) Delete file\n");
-        printf("7) Logout\n");
+        printf("6) Change permissions\n");
+        printf("7) Delete file\n");
+        printf("8) Logout\n");
         ask("Choose: ", choice, sizeof(choice));
 
         if (strcmp(choice, "1") == 0) {
@@ -617,8 +666,10 @@ static void vault_menu(void) {
         } else if (strcmp(choice, "5") == 0) {
             screen_file_info();
         } else if (strcmp(choice, "6") == 0) {
-            screen_delete_file();
+            screen_chmod_file();
         } else if (strcmp(choice, "7") == 0) {
+            screen_delete_file();
+        } else if (strcmp(choice, "8") == 0) {
             audit(session_user, "LOGOUT", "SUCCESS");
             session_active = 0;
             return;
