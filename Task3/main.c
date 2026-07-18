@@ -261,30 +261,32 @@ static int file_exists(const char *path) {
 /* Each file has a metadata file that stores
    the owner, group and permission settings. */
 
-/* Saves metadata for a file: owner, group, and permissions. */
+/* Saves metadata for a file: owner, group, permissions, and encryption state. */
 static void write_meta(const char *filename, const char *owner,
-                        const char *group, const char *perms) {
+                        const char *group, const char *perms, int encrypted) {
     char path[MAX_PATH];
     meta_path(filename, path);
     FILE *f = fopen(path, "w");
     if (!f) return;
-    fprintf(f, "owner=%s\ngroup=%s\nperms=%s\n", owner, group, perms);
+    fprintf(f, "owner=%s\ngroup=%s\nperms=%s\nencrypted=%d\n", owner, group, perms, encrypted);
     fclose(f);
 }
 
 /* Reads the saved metadata for a file. */
-static int read_meta(const char *filename, char *owner, char *group, char *perms) {
+static int read_meta(const char *filename, char *owner, char *group, char *perms, int *encrypted) {
     char path[MAX_PATH];
     meta_path(filename, path);
     FILE *f = fopen(path, "r");
     if (!f) return 0;
 
+    *encrypted = 0;
     char line[MAX_LINE];
     while (fgets(line, sizeof(line), f)) {
         strip_nl(line);
         if (strncmp(line, "owner=", 6) == 0) strcpy(owner, line + 6);
         else if (strncmp(line, "group=", 6) == 0) strcpy(group, line + 6);
         else if (strncmp(line, "perms=", 6) == 0) strcpy(perms, line + 6);
+        else if (strncmp(line, "encrypted=", 10) == 0) *encrypted = atoi(line + 10);
     }
     fclose(f);
     return 1;
@@ -319,6 +321,21 @@ static int has_permission(const char *perms, char relation, char action) {
     return perms[base + offset] == action;
 }
 
+/* Encryption uses XOR with a passphrase-derived byte stream.
+   The same operation both encrypts and decrypts - XOR twice
+   with the same passphrase returns the original content.
+   This is not production-grade encryption (no integrity check,
+   vulnerable to known-plaintext attacks) - it demonstrates the
+   required encrypt/decrypt capability simply. A real system
+   should use an authenticated cipher such as AES-256-GCM. */
+static void xor_cipher(unsigned char *data, long length, const char *passphrase) {
+    int key_len = strlen(passphrase);
+    if (key_len == 0) return;
+    for (long i = 0; i < length; i++) {
+        data[i] ^= passphrase[i % key_len];
+    }
+}
+
 /* Creates a new empty file with the specified permissions and metadata. */
 static int create_vault_file(const char *filename, const char *perms) {
     char path[MAX_PATH];
@@ -334,7 +351,7 @@ static int create_vault_file(const char *filename, const char *perms) {
     }
     fclose(f);
 
-    write_meta(filename, session_user, session_group, perms);
+    write_meta(filename, session_user, session_group, perms, 0);
     return 1;
 }
 
@@ -347,7 +364,7 @@ static void list_vault_files(void) {
     }
     
     printf("\n" CLR_INFO "Files in vault:" CLR_RESET "\n");
-    printf("%-20s %-12s %-10s %s\n", "Filename", "Owner", "Group", "Perms");
+    printf("%-20s %-12s %-10s %-10s %s\n", "Filename", "Owner", "Group", "Perms", "Encrypted");
     printf("--------------------------------------------------------\n");
     
     struct dirent *entry;
@@ -361,8 +378,10 @@ static void list_vault_files(void) {
             filename[ext - entry->d_name] = '\0';
             
             char owner[MAX_NAME], group[MAX_NAME], perms[16];
-            if (read_meta(filename, owner, group, perms)) {
-                printf("%-20s %-12s %-10s %s\n", filename, owner, group, perms);
+            int encrypted;
+            if (read_meta(filename, owner, group, perms, &encrypted)) {
+                printf("%-20s %-12s %-10s %-10s %s\n", filename, owner, group, perms,
+                       encrypted ? "yes" : "no");
                 count++;
             }
         }
@@ -376,8 +395,9 @@ static void list_vault_files(void) {
 /* Displays detailed information about a specific file. */
 static void file_info(const char *filename) {
     char owner[MAX_NAME], group[MAX_NAME], perms[16];
+    int encrypted;
     
-    if (!read_meta(filename, owner, group, perms)) {
+    if (!read_meta(filename, owner, group, perms, &encrypted)) {
         err("File not found.");
         audit(session_user, "FILE_INFO", "FAILED (not found)");
         return;
@@ -387,6 +407,7 @@ static void file_info(const char *filename) {
     printf("  Owner: %s\n", owner);
     printf("  Group: %s\n", group);
     printf("  Permissions: %s\n", perms);
+    printf("  Encrypted: %s\n", encrypted ? "yes" : "no");
     
     char relation = relation_to(session_user, session_group, owner, group);
     printf("  Your relation: %s\n", 
@@ -403,8 +424,9 @@ static void file_info(const char *filename) {
 /* Deletes a file if the user has write permission. */
 static void delete_vault_file(const char *filename) {
     char owner[MAX_NAME], group[MAX_NAME], perms[16];
+    int encrypted;
     
-    if (!read_meta(filename, owner, group, perms)) {
+    if (!read_meta(filename, owner, group, perms, &encrypted)) {
         err("File not found.");
         audit(session_user, "DELETE", "FAILED (not found)");
         return;
@@ -436,8 +458,9 @@ static void delete_vault_file(const char *filename) {
 /* Reads a file's contents into buffer if the user has read permission. */
 static int read_vault_file(const char *filename, char *buffer, int buf_size) {
     char owner[MAX_NAME], group[MAX_NAME], perms[16];
+    int encrypted;
 
-    if (!read_meta(filename, owner, group, perms)) {
+    if (!read_meta(filename, owner, group, perms, &encrypted)) {
         err("File not found.");
         audit(session_user, "READ", "FAILED (not found)");
         return 0;
@@ -463,6 +486,13 @@ static int read_vault_file(const char *filename, char *buffer, int buf_size) {
     buffer[len] = '\0';
     fclose(f);
 
+    if (encrypted) {
+        char passphrase[MAX_PASS];
+        ask_secret("File is encrypted, enter passphrase to view: ", passphrase, sizeof(passphrase));
+        xor_cipher((unsigned char *)buffer, len, passphrase);
+        printf("(If that looks like garbage, the passphrase was wrong.)\n");
+    }
+
     audit(session_user, "READ", "SUCCESS");
     return 1;
 }
@@ -470,8 +500,9 @@ static int read_vault_file(const char *filename, char *buffer, int buf_size) {
 /* Writes or appends text to a file if the user has write permission. */
 static int write_vault_file(const char *filename, const char *content, int append) {
     char owner[MAX_NAME], group[MAX_NAME], perms[16];
+    int encrypted;
 
-    if (!read_meta(filename, owner, group, perms)) {
+    if (!read_meta(filename, owner, group, perms, &encrypted)) {
         err("File not found.");
         audit(session_user, "WRITE", "FAILED (not found)");
         return 0;
@@ -481,6 +512,12 @@ static int write_vault_file(const char *filename, const char *content, int appen
     if (!has_permission(perms, relation, 'w')) {
         err("Permission denied - you need write permission.");
         audit(session_user, "WRITE", "FAILED (permission denied)");
+        return 0;
+    }
+
+    if (encrypted) {
+        err("File is encrypted - decrypt it first before writing.");
+        audit(session_user, "WRITE", "BLOCKED (file encrypted)");
         return 0;
     }
 
@@ -503,8 +540,9 @@ static int write_vault_file(const char *filename, const char *content, int appen
 /* Changes a file's permission string. Only the owner can do this. */
 static int chmod_vault_file(const char *filename, const char *new_perms) {
     char owner[MAX_NAME], group[MAX_NAME], perms[16];
+    int encrypted;
 
-    if (!read_meta(filename, owner, group, perms)) {
+    if (!read_meta(filename, owner, group, perms, &encrypted)) {
         err("File not found.");
         audit(session_user, "CHMOD", "FAILED (not found)");
         return 0;
@@ -522,9 +560,103 @@ static int chmod_vault_file(const char *filename, const char *new_perms) {
         return 0;
     }
 
-    write_meta(filename, owner, group, new_perms);
+    write_meta(filename, owner, group, new_perms, encrypted);
     ok("Permissions updated.");
     audit(session_user, "CHMOD", "SUCCESS");
+    return 1;
+}
+
+/* Encrypts a file on disk with a passphrase. Requires write permission. */
+static int encrypt_vault_file(const char *filename, const char *passphrase) {
+    char owner[MAX_NAME], group[MAX_NAME], perms[16];
+    int encrypted;
+
+    if (!read_meta(filename, owner, group, perms, &encrypted)) {
+        err("File not found.");
+        audit(session_user, "ENCRYPT", "FAILED (not found)");
+        return 0;
+    }
+
+    char relation = relation_to(session_user, session_group, owner, group);
+    if (!has_permission(perms, relation, 'w')) {
+        err("Permission denied - you need write permission.");
+        audit(session_user, "ENCRYPT", "FAILED (permission denied)");
+        return 0;
+    }
+
+    if (encrypted) {
+        err("File is already encrypted.");
+        return 0;
+    }
+
+    char path[MAX_PATH];
+    storage_path(filename, path);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        err("Could not open file.");
+        audit(session_user, "ENCRYPT", "FAILED (I/O error)");
+        return 0;
+    }
+    unsigned char buffer[MAX_CONTENT];
+    long len = fread(buffer, 1, MAX_CONTENT, f);
+    fclose(f);
+
+    xor_cipher(buffer, len, passphrase);
+
+    f = fopen(path, "wb");
+    fwrite(buffer, 1, len, f);
+    fclose(f);
+
+    write_meta(filename, owner, group, perms, 1);
+    ok("File encrypted.");
+    audit(session_user, "ENCRYPT", "SUCCESS");
+    return 1;
+}
+
+/* Decrypts a file on disk with a passphrase. Requires write permission. */
+static int decrypt_vault_file(const char *filename, const char *passphrase) {
+    char owner[MAX_NAME], group[MAX_NAME], perms[16];
+    int encrypted;
+
+    if (!read_meta(filename, owner, group, perms, &encrypted)) {
+        err("File not found.");
+        audit(session_user, "DECRYPT", "FAILED (not found)");
+        return 0;
+    }
+
+    char relation = relation_to(session_user, session_group, owner, group);
+    if (!has_permission(perms, relation, 'w')) {
+        err("Permission denied - you need write permission.");
+        audit(session_user, "DECRYPT", "FAILED (permission denied)");
+        return 0;
+    }
+
+    if (!encrypted) {
+        err("File is not encrypted.");
+        return 0;
+    }
+
+    char path[MAX_PATH];
+    storage_path(filename, path);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        err("Could not open file.");
+        audit(session_user, "DECRYPT", "FAILED (I/O error)");
+        return 0;
+    }
+    unsigned char buffer[MAX_CONTENT];
+    long len = fread(buffer, 1, MAX_CONTENT, f);
+    fclose(f);
+
+    xor_cipher(buffer, len, passphrase);
+
+    f = fopen(path, "wb");
+    fwrite(buffer, 1, len, f);
+    fclose(f);
+
+    write_meta(filename, owner, group, perms, 0);
+    ok("File decrypted. If the passphrase was wrong, the content is now garbled.");
+    audit(session_user, "DECRYPT", "SUCCESS (unverified passphrase)");
     return 1;
 }
 
@@ -610,7 +742,8 @@ static void screen_chmod_file(void) {
     ask("Filename : ", filename, sizeof(filename));
 
     char owner[MAX_NAME], group[MAX_NAME], perms[16];
-    if (!read_meta(filename, owner, group, perms)) {
+    int encrypted;
+    if (!read_meta(filename, owner, group, perms, &encrypted)) {
         err("File not found.");
         return;
     }
@@ -621,6 +754,36 @@ static void screen_chmod_file(void) {
     ask("New permissions : ", new_perms, sizeof(new_perms));
 
     chmod_vault_file(filename, new_perms);
+}
+
+/* Screen for encrypting a file. */
+static void screen_encrypt_file(void) {
+    section("Encrypt File");
+    char filename[MAX_FILENAME];
+    ask("Filename : ", filename, sizeof(filename));
+
+    char passphrase[MAX_PASS], confirm[MAX_PASS];
+    ask_secret("Passphrase : ", passphrase, sizeof(passphrase));
+    ask_secret("Confirm    : ", confirm, sizeof(confirm));
+
+    if (strcmp(passphrase, confirm) != 0) {
+        err("Passphrases did not match.");
+        return;
+    }
+
+    encrypt_vault_file(filename, passphrase);
+}
+
+/* Screen for decrypting a file. */
+static void screen_decrypt_file(void) {
+    section("Decrypt File");
+    char filename[MAX_FILENAME];
+    ask("Filename : ", filename, sizeof(filename));
+
+    char passphrase[MAX_PASS];
+    ask_secret("Passphrase : ", passphrase, sizeof(passphrase));
+
+    decrypt_vault_file(filename, passphrase);
 }
 
 /* Screen for deleting a file. */
@@ -651,8 +814,10 @@ static void vault_menu(void) {
         printf("4) List files\n");
         printf("5) File info\n");
         printf("6) Change permissions\n");
-        printf("7) Delete file\n");
-        printf("8) Logout\n");
+        printf("7) Encrypt file\n");
+        printf("8) Decrypt file\n");
+        printf("9) Delete file\n");
+        printf("10) Logout\n");
         ask("Choose: ", choice, sizeof(choice));
 
         if (strcmp(choice, "1") == 0) {
@@ -668,8 +833,12 @@ static void vault_menu(void) {
         } else if (strcmp(choice, "6") == 0) {
             screen_chmod_file();
         } else if (strcmp(choice, "7") == 0) {
-            screen_delete_file();
+            screen_encrypt_file();
         } else if (strcmp(choice, "8") == 0) {
+            screen_decrypt_file();
+        } else if (strcmp(choice, "9") == 0) {
+            screen_delete_file();
+        } else if (strcmp(choice, "10") == 0) {
             audit(session_user, "LOGOUT", "SUCCESS");
             session_active = 0;
             return;
