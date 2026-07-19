@@ -3,14 +3,16 @@
 #include <string.h>
 #include <unistd.h>
 #include <time.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 
 #define DEFAULT_PORT 5555
 #define BUFFER_SIZE  1024
-#define USERS_FILE   "chat_users.db"
+#define USERS_FILE   "users.db"
 #define MAX_NAME     64
 #define MAX_PASS     128
+#define MAX_CLIENTS  10
 
 #define CLR_RESET  "\033[0m"
 #define CLR_OK     "\033[32m"   /* green  - success   */
@@ -20,6 +22,18 @@
 static void ok(const char *msg)  { printf(CLR_OK  "%s" CLR_RESET "\n", msg); }
 static void err(const char *msg) { printf(CLR_ERR "%s" CLR_RESET "\n", msg); }
 static void info(const char *msg) { printf(CLR_INFO "%s" CLR_RESET "\n", msg); }
+
+/* Tracks every connected, authenticated client. Protected by
+   clients_mutex since multiple client threads read/write it at once
+   (adding themselves, removing themselves, broadcasting). */
+typedef struct {
+    int  socket;
+    char username[MAX_NAME];
+    int  active;
+} ClientInfo;
+
+ClientInfo clients[MAX_CLIENTS];
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 /* Reads one line from the socket, stopping at '\n'. */
 int recv_line(int sock, char *buf, int maxlen) {
@@ -163,6 +177,45 @@ int authenticate_session(int client_sock, char *username_out) {
     }
 }
 
+/* Adds a client to the first free slot. Returns the slot index, or -1
+   if the server is already at MAX_CLIENTS. */
+int add_client(int sock, const char *username) {
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (!clients[i].active) {
+            clients[i].socket = sock;
+            clients[i].active = 1;
+            strncpy(clients[i].username, username, MAX_NAME - 1);
+            clients[i].username[MAX_NAME - 1] = '\0';
+            pthread_mutex_unlock(&clients_mutex);
+            return i;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+    return -1;
+}
+
+/* Frees a client's slot on disconnect. */
+void remove_client(int index) {
+    pthread_mutex_lock(&clients_mutex);
+    if (index >= 0 && index < MAX_CLIENTS) {
+        clients[index].active = 0;
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
+/* Sends a message to every connected client except exclude_socket
+   (pass -1 to exclude nobody). */
+void broadcast_message(const char *message, int exclude_socket) {
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].active && clients[i].socket != exclude_socket) {
+            send_line(clients[i].socket, message);
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+}
+
 /* Handles one authenticated client's commands until QUIT or disconnect. */
 void handle_client(int client_sock, const char *username) {
     char buffer[BUFFER_SIZE];
@@ -179,9 +232,9 @@ void handle_client(int client_sock, const char *username) {
         if (strncmp(buffer, "MSG ", 4) == 0) {
             const char *text = buffer + 4;
             printf(CLR_INFO "[%s]:" CLR_RESET " %s\n", username, text);
-            char reply[BUFFER_SIZE];
-            snprintf(reply, sizeof(reply), "ACK %s", text);
-            send_line(client_sock, reply);
+            char formatted[BUFFER_SIZE];
+            snprintf(formatted, sizeof(formatted), "[%s]: %s", username, text);
+            broadcast_message(formatted, -1); /* -1: sender sees their own message too */
 
         } else if (strcmp(buffer, "PING") == 0) {
             send_line(client_sock, "PONG");
@@ -196,9 +249,51 @@ void handle_client(int client_sock, const char *username) {
     }
 }
 
+/* Handles one connection's whole lifecycle: login, join notice,
+   command loop, and cleanup on disconnect. Runs on its own thread,
+   so multiple clients are handled concurrently. */
+void *client_thread(void *arg) {
+    int client_sock = *(int *)arg;
+    free(arg);
+
+    char username[MAX_NAME];
+    if (!authenticate_session(client_sock, username)) {
+        err("Client disconnected before logging in.");
+        close(client_sock);
+        return NULL;
+    }
+
+    int idx = add_client(client_sock, username);
+    if (idx == -1) {
+        send_line(client_sock, "ERROR Server is full, try again later");
+        err("Rejected a client - server full.");
+        close(client_sock);
+        return NULL;
+    }
+
+    char msg[96];
+    snprintf(msg, sizeof(msg), "%s authenticated and joined.", username);
+    ok(msg);
+
+    char join_notice[128];
+    snprintf(join_notice, sizeof(join_notice), "*** %s has joined the chat ***", username);
+    broadcast_message(join_notice, client_sock);
+
+    handle_client(client_sock, username);
+
+    remove_client(idx);
+    char leave_notice[128];
+    snprintf(leave_notice, sizeof(leave_notice), "*** %s has left the chat ***", username);
+    broadcast_message(leave_notice, -1);
+
+    close(client_sock);
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     int port = (argc > 1) ? atoi(argv[1]) : DEFAULT_PORT;
     srand((unsigned int)time(NULL));
+    for (int i = 0; i < MAX_CLIENTS; i++) clients[i].active = 0;
 
     int server_sock = socket(AF_INET, SOCK_STREAM, 0);
     if (server_sock < 0) {
@@ -221,7 +316,7 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    if (listen(server_sock, 1) < 0) {
+    if (listen(server_sock, MAX_CLIENTS) < 0) {
         perror("listen() failed");
         close(server_sock);
         return 1;
@@ -229,27 +324,29 @@ int main(int argc, char *argv[]) {
 
     printf(CLR_INFO "Server listening on port %d..." CLR_RESET "\n", port);
 
-    struct sockaddr_in client_addr;
-    socklen_t addr_len = sizeof(client_addr);
-    int client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_len);
-    if (client_sock < 0) {
-        perror("accept() failed");
-        close(server_sock);
-        return 1;
-    }
-    info("Client connected, awaiting login...");
+    while (1) {
+        struct sockaddr_in client_addr;
+        socklen_t addr_len = sizeof(client_addr);
+        int client_sock = accept(server_sock, (struct sockaddr *)&client_addr, &addr_len);
+        if (client_sock < 0) {
+            perror("accept() failed");
+            continue;
+        }
+        info("Client connected, awaiting login...");
 
-    char username[MAX_NAME];
-    if (authenticate_session(client_sock, username)) {
-        char msg[96];
-        snprintf(msg, sizeof(msg), "%s authenticated.", username);
-        ok(msg);
-        handle_client(client_sock, username);
-    } else {
-        err("Client disconnected before logging in.");
+        int *sock_ptr = malloc(sizeof(int));
+        *sock_ptr = client_sock;
+
+        pthread_t tid;
+        if (pthread_create(&tid, NULL, client_thread, sock_ptr) != 0) {
+            perror("pthread_create() failed");
+            close(client_sock);
+            free(sock_ptr);
+            continue;
+        }
+        pthread_detach(tid);
     }
 
-    close(client_sock);
     close(server_sock);
     return 0;
 }
