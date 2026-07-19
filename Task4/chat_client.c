@@ -10,6 +10,15 @@
 #define DEFAULT_PORT 5555
 #define BUFFER_SIZE  1024
 
+#define CLR_RESET  "\033[0m"
+#define CLR_OK     "\033[32m"   /* green  - success   */
+#define CLR_ERR    "\033[31m"   /* red    - failure   */
+#define CLR_INFO   "\033[36m"   /* cyan   - headings  */
+#define CLR_PROMPT "\033[35m"   /* magenta - prompts  */
+
+static void ok(const char *msg)  { printf(CLR_OK  "%s" CLR_RESET "\n", msg); }
+static void err(const char *msg) { printf(CLR_ERR "%s" CLR_RESET "\n", msg); }
+
 /* Reads one line from the socket, stopping at '\n'. */
 int recv_line(int sock, char *buf, int maxlen) {
     int i = 0;
@@ -47,6 +56,56 @@ void read_hidden(const char *prompt, char *buf, int size) {
     buf[strcspn(buf, "\n")] = '\0';
 }
 
+/* Handles the pre-login phase: lets the user register and/or log in,
+   retrying on failure instead of giving up after one bad attempt.
+   Returns 1 once LOGIN succeeds. */
+int authenticate(int sock) {
+    char choice[8], username[64], password[64];
+
+    while (1) {
+        printf("\n" CLR_INFO "1) Register\n2) Login" CLR_RESET "\n");
+        printf(CLR_PROMPT "Choose: " CLR_RESET);
+        fflush(stdout);
+        fgets(choice, sizeof(choice), stdin);
+
+        printf(CLR_PROMPT "Username: " CLR_RESET);
+        fflush(stdout);
+        fgets(username, sizeof(username), stdin);
+        username[strcspn(username, "\n")] = '\0';
+        read_hidden(CLR_PROMPT "Password: " CLR_RESET, password, sizeof(password));
+
+        char cmd[16];
+        strcpy(cmd, (choice[0] == '1') ? "REGISTER" : "LOGIN");
+
+        char line[160];
+        snprintf(line, sizeof(line), "%s %s %s", cmd, username, password);
+        send_line(sock, line);
+
+        char response[BUFFER_SIZE];
+        int n = recv_line(sock, response, sizeof(response));
+        if (n <= 0) {
+            err("Server closed the connection.");
+            return 0;
+        }
+
+        if (strncmp(response, "LOGIN_OK", 8) == 0) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Login successful. Welcome, %s!", username);
+            ok(msg);
+            return 1;
+        } else if (strncmp(response, "LOGIN_FAIL", 10) == 0) {
+            err("Login failed: invalid username or password.");
+        } else if (strncmp(response, "REGISTER_OK", 11) == 0) {
+            ok("Registration successful! You can now log in.");
+        } else if (strncmp(response, "REGISTER_FAIL", 13) == 0) {
+            err("Registration failed: that username is already taken.");
+        } else {
+            err(response);
+        }
+        /* loop and try again */
+    }
+}
+
 int main(int argc, char *argv[]) {
     const char *server_ip = (argc > 1) ? argv[1] : "127.0.0.1";
     int port = (argc > 2) ? atoi(argv[2]) : DEFAULT_PORT;
@@ -76,32 +135,12 @@ int main(int argc, char *argv[]) {
 
     printf("Connected to %s:%d\n", server_ip, port);
 
-    char username[64], password[64];
-    printf("Username: ");
-    fflush(stdout);
-    fgets(username, sizeof(username), stdin);
-    username[strcspn(username, "\n")] = '\0';
-    read_hidden("Password: ", password, sizeof(password));
-
-    char login_cmd[160];
-    snprintf(login_cmd, sizeof(login_cmd), "LOGIN %s %s", username, password);
-    send_line(sock, login_cmd);
-
-    char response[BUFFER_SIZE];
-    int n = recv_line(sock, response, sizeof(response));
-    if (n <= 0) {
-        printf("Server closed the connection.\n");
+    if (!authenticate(sock)) {
         close(sock);
         return 1;
     }
-    printf("%s\n", response);
 
-    if (strncmp(response, "LOGIN_OK", 8) != 0) {
-        close(sock);
-        return 1; /* login failed, nothing more to do */
-    }
-
-    printf("Type a message to send it, 'ping' to ping the server, or 'quit' to disconnect.\n");
+    printf("\nType a message to send it, 'ping' to ping the server, or 'quit' to disconnect.\n");
 
     char line[BUFFER_SIZE];
     while (fgets(line, sizeof(line), stdin)) {
@@ -112,7 +151,7 @@ int main(int argc, char *argv[]) {
             send_line(sock, "QUIT");
             char reply[BUFFER_SIZE];
             recv_line(sock, reply, sizeof(reply));
-            printf("Server: %s\n", reply);
+            printf(CLR_INFO "Server:" CLR_RESET " %s\n", reply);
             break;
 
         } else if (strcmp(line, "ping") == 0) {
@@ -125,12 +164,12 @@ int main(int argc, char *argv[]) {
         }
 
         char reply[BUFFER_SIZE];
-        n = recv_line(sock, reply, sizeof(reply));
+        int n = recv_line(sock, reply, sizeof(reply));
         if (n <= 0) {
-            printf("Server closed the connection.\n");
+            err("Server closed the connection.");
             break;
         }
-        printf("Server: %s\n", reply);
+        printf(CLR_INFO "Server:" CLR_RESET " %s\n", reply);
     }
 
     close(sock);
