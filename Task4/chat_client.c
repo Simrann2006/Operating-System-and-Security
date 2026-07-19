@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <termios.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -29,6 +30,21 @@ void send_line(int sock, const char *msg) {
     char out[BUFFER_SIZE];
     snprintf(out, sizeof(out), "%s\n", msg);
     send(sock, out, strlen(out), 0);
+}
+
+/* Reads a password with terminal echo turned off. */
+void read_hidden(const char *prompt, char *buf, int size) {
+    struct termios oldt, newt;
+    printf("%s", prompt);
+    fflush(stdout);
+    tcgetattr(STDIN_FILENO, &oldt);
+    newt = oldt;
+    newt.c_lflag &= ~ECHO;
+    tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    fgets(buf, size, stdin);
+    tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+    printf("\n");
+    buf[strcspn(buf, "\n")] = '\0';
 }
 
 int main(int argc, char *argv[]) {
@@ -59,6 +75,32 @@ int main(int argc, char *argv[]) {
     }
 
     printf("Connected to %s:%d\n", server_ip, port);
+
+    char username[64], password[64];
+    printf("Username: ");
+    fflush(stdout);
+    fgets(username, sizeof(username), stdin);
+    username[strcspn(username, "\n")] = '\0';
+    read_hidden("Password: ", password, sizeof(password));
+
+    char login_cmd[160];
+    snprintf(login_cmd, sizeof(login_cmd), "LOGIN %s %s", username, password);
+    send_line(sock, login_cmd);
+
+    char response[BUFFER_SIZE];
+    int n = recv_line(sock, response, sizeof(response));
+    if (n <= 0) {
+        printf("Server closed the connection.\n");
+        close(sock);
+        return 1;
+    }
+    printf("%s\n", response);
+
+    if (strncmp(response, "LOGIN_OK", 8) != 0) {
+        close(sock);
+        return 1; /* login failed, nothing more to do */
+    }
+
     printf("Type a message to send it, 'ping' to ping the server, or 'quit' to disconnect.\n");
 
     char line[BUFFER_SIZE];
@@ -83,7 +125,7 @@ int main(int argc, char *argv[]) {
         }
 
         char reply[BUFFER_SIZE];
-        int n = recv_line(sock, reply, sizeof(reply));
+        n = recv_line(sock, reply, sizeof(reply));
         if (n <= 0) {
             printf("Server closed the connection.\n");
             break;
