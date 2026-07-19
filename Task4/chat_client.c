@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <termios.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -18,6 +19,9 @@
 
 static void ok(const char *msg)  { printf(CLR_OK  "%s" CLR_RESET "\n", msg); }
 static void err(const char *msg) { printf(CLR_ERR "%s" CLR_RESET "\n", msg); }
+
+int sock;
+int running = 1;
 
 /* Reads one line from the socket, stopping at '\n'. */
 int recv_line(int sock, char *buf, int maxlen) {
@@ -106,11 +110,30 @@ int authenticate(int sock) {
     }
 }
 
+/* Continuously prints whatever the server sends - runs on its own
+   thread so a message from another client shows up immediately,
+   even while this client is just sitting idle waiting for input. */
+void *receiver_thread(void *arg) {
+    (void)arg;
+    char buf[BUFFER_SIZE];
+    while (running) {
+        int n = recv_line(sock, buf, sizeof(buf));
+        if (n <= 0) {
+            if (running) err("Disconnected from server.");
+            running = 0;
+            break;
+        }
+        printf(CLR_INFO "%s" CLR_RESET "\n", buf);
+        fflush(stdout);
+    }
+    return NULL;
+}
+
 int main(int argc, char *argv[]) {
     const char *server_ip = (argc > 1) ? argv[1] : "127.0.0.1";
     int port = (argc > 2) ? atoi(argv[2]) : DEFAULT_PORT;
 
-    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
         perror("socket() failed");
         return 1;
@@ -140,18 +163,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    pthread_t tid;
+    pthread_create(&tid, NULL, receiver_thread, NULL);
+    pthread_detach(tid);
+
     printf("\nType a message to send it, 'ping' to ping the server, or 'quit' to disconnect.\n");
 
     char line[BUFFER_SIZE];
-    while (fgets(line, sizeof(line), stdin)) {
+    while (running && fgets(line, sizeof(line), stdin)) {
         line[strcspn(line, "\n")] = '\0';
         if (strlen(line) == 0) continue;
 
         if (strcmp(line, "quit") == 0) {
             send_line(sock, "QUIT");
-            char reply[BUFFER_SIZE];
-            recv_line(sock, reply, sizeof(reply));
-            printf(CLR_INFO "Server:" CLR_RESET " %s\n", reply);
+            usleep(200000); /* let the receiver thread print the server's BYE first */
+            running = 0;
             break;
 
         } else if (strcmp(line, "ping") == 0) {
@@ -162,14 +188,6 @@ int main(int argc, char *argv[]) {
             snprintf(cmd, sizeof(cmd), "MSG %s", line);
             send_line(sock, cmd);
         }
-
-        char reply[BUFFER_SIZE];
-        int n = recv_line(sock, reply, sizeof(reply));
-        if (n <= 0) {
-            err("Server closed the connection.");
-            break;
-        }
-        printf(CLR_INFO "Server:" CLR_RESET " %s\n", reply);
     }
 
     close(sock);
