@@ -2,7 +2,7 @@
 
 Simran Chaudhary · 240751 · Softwarica College of IT & E-Commerce
 
-This repo contains my four-part submission for ST5004CEM. Each part is a standalone C program that implements a different operating-systems topic hands-on rather than just describing it on paper. Short summary of what each one actually does is below, followed by how to build and run them.
+This repo contains my four-part submission for ST5004CEM. Each part is a standalone C program that implements a different operating-systems topic.
 
 ## Layout
 
@@ -24,23 +24,23 @@ This repo contains my four-part submission for ST5004CEM. Each part is a standal
 
 ## Task 1 — Threads, Race Conditions & Deadlock Avoidance
 
-`task1/main.c` runs two back-to-back demos:
+`Task1/main.c` runs two back-to-back demos:
 
 - **Unsafe vs. safe counter.** Three threads hammer a shared `long` counter 500,000 times each. Run once with no locking (the total comes out wrong/inconsistent because increments overlap), then run again wrapping each increment in a mutex (the total is now always correct).
 - **Round robin + deadlock-free resource sharing.** The same three threads then take turns executing under a simple round-robin scheduler — a shared `current_turn` value plus a condition variable puts each thread to sleep until it's their turn, avoiding busy-waiting. During its turn, each thread grabs two shared "resources"; even-numbered threads grab them in the order A→B, odd-numbered threads grab them B→A, which is the standard recipe for deadlock. It's avoided with a no-hold-and-wait pattern: lock the first resource, `trylock` the second, and if that fails, release the first and retry after a short random pause instead of sitting there holding it.
 
 ```
-cd task1
+cd Task1
 gcc -Wall -o main main.c -lpthread
 ./main
 ```
 
 ## Task 2 — Virtual Memory / Page Replacement Simulator
 
-`task2/main.c` takes the frame count and page size as command-line arguments and runs a fixed 20-reference access pattern through **both** FIFO and LRU so the two algorithms are compared on identical input. For every reference it prints whether it was a hit or a fault, which frame got filled or evicted, and a small ASCII diagram of memory state at that point; it finishes with a side-by-side table of total hits/faults and hit/miss ratio for each algorithm.
+`Task2/main.c` takes the frame count and page size as command-line arguments and runs a fixed 20-reference access pattern through **both** FIFO and LRU so the two algorithms are compared on identical input. For every reference it prints whether it was a hit or a fault, which frame got filled or evicted, and a small ASCII diagram of memory state at that point; it finishes with a side-by-side table of total hits/faults and hit/miss ratio for each algorithm.
 
 ```
-cd task2
+cd Task2
 gcc -Wall -o main main.c
 ./main <num_frames> <page_size_bytes>
 # e.g. ./main 4 256
@@ -48,7 +48,7 @@ gcc -Wall -o main main.c
 
 ## Task 3 — Secure Vault (File System + Security)
 
-`task3/main.c` is a terminal "vault" app with its own account system and encrypted file store (`vault_data/`):
+`Task3/main.c` is a terminal "vault" app with its own account system and encrypted file store (`vault_data/`):
 
 - Accounts register/log in with passwords stored as a salted, iterated hash (never plaintext); passwords are typed with terminal echo disabled.
 - Every stored file gets a sidecar `.meta` entry recording owner, group, a 9-character `rwxrwxrwx`-style permission string, and whether it's currently encrypted.
@@ -57,14 +57,14 @@ gcc -Wall -o main main.c
 - Every action (register, login, create, read, write, chmod, encrypt, decrypt, delete) is timestamped and appended to `vault_data/audit.log`, whether it succeeded or failed and why.
 
 ```
-cd task3
+cd Task3
 gcc -Wall -o main main.c
 ./main
 ```
 
 ## Task 4 — TCP Chat Server & Client (Sockets + IPC)
 
-`task4/chat_server.c` and `task4/chat_client.c` implement a small multi-user chat system over raw TCP sockets with a plain-text, line-terminated protocol (`LOGIN`, `REGISTER`, `MSG`, `PING`, `QUIT`, …):
+`Task4/chat_server.c` and `Task4/chat_client.c` implement a small multi-user chat system over raw TCP sockets with a plain-text, line-terminated protocol (`LOGIN`, `REGISTER`, `MSG`, `PING`, `QUIT`, …):
 
 - The server accepts connections, spawns one thread per client, and requires `REGISTER`/`LOGIN` (same salted-hash scheme as Task 3) before any chat command is accepted.
 - Connected clients are tracked in a fixed-size array guarded by a mutex, since multiple client threads read and modify it concurrently (adding, removing, broadcasting).
@@ -72,7 +72,7 @@ gcc -Wall -o main main.c
 - The client hides password entry, authenticates in a retry loop rather than dropping the connection on the first wrong password, and runs a separate receiver thread so incoming messages appear immediately instead of only after the user presses enter.
 
 ```
-cd task4
+cd Task4
 gcc -Wall -o chat_server chat_server.c -lpthread
 gcc -Wall -o chat_client chat_client.c -lpthread
 ./chat_server            # terminal 1
